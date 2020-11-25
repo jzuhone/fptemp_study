@@ -3,24 +3,29 @@ from numpy.random import RandomState
 from Quaternion import Quat
 from astropy.io import ascii
 import xija
+from astropy.constants import R_earth
 from astropy.coordinates import solar_system_ephemeris, \
     get_body, SkyCoord
 from cxotime import CxoTime
 import Ska.Sun
 import Ska.quatutil
-from chandra_models import get_xija_model_file
+import Ska.astro
 
 solar_system_ephemeris.set('jpl')
 
+R_e = R_earth.to_value("km")
 
-def make_states(start, stop, ccd_count, q):
+def make_states(start, stop, ccd_count, q, fep_count=None, clocking=1,
+                simpos=75624.0):
+    if fep_count is None:
+        fep_count = ccd_count
     tstart = float(CxoTime(start).secs)
     tstop = float(CxoTime(stop).secs)
     states = {"ccd_count": np.array([ccd_count], dtype='int'),
-              "fep_count": np.array([ccd_count], dtype='int'),
-              "clocking": np.array([1], dtype='int'),
-              "vid_board": np.array([1], dtype='int'),
-              "simpos": np.array([75624.0]),
+              "fep_count": np.array([fep_count], dtype='int'),
+              "clocking": np.array([clocking], dtype='int'),
+              "vid_board": np.array([ccd_count > 0], dtype='int'),
+              "simpos": np.array([simpos]),
               "tstart": np.array([tstart]),
               "tstop": np.array([tstop]),
               "q1": np.array([q[0]]),
@@ -78,46 +83,51 @@ def generate_targets(tstart, num_targs, prng=None):
     elif isinstance(prng, int):
         prng = RandomState(prng)
 
-    targets = np.array([])
+    ra_t = np.array([])
+    dec_t = np.array([])
 
     t = CxoTime(tstart)
     sun = get_body('sun', t)
 
-    while len(targets) < num_targs:
+    while len(ra_t) < num_targs:
         ra = 360.0*prng.uniform(low=0.0, high=1.0, size=num_targs)
         dec = np.arccos(prng.uniform(low=-1.0, high=1.0, size=num_targs))
-        dec = np.rad2deg(dec-0.5*np.pi)
+        dec = np.rad2deg(dec)-90.0
         tcoord = SkyCoord(ra=ra, dec=dec, unit='deg')
-        pitch = tcoord.separation(sun).to_value("deg")
+        pitch = sun.separation(tcoord).to_value("deg")
         good = (pitch > 46.2) & (pitch < 177.9)
-        targets = np.append(targets, tcoord[good])
+        ra_t = np.append(ra_t, tcoord.ra.to_value("deg")[good])
+        dec_t = np.append(dec_t, tcoord.dec.to_value("deg")[good])
 
-    targets = SkyCoord(targets[:num_targs])
-    ra = targets.ra.to_value('deg')
-    dec = targets.ra.to_value('deg')
     sun_ra = sun.ra.to_value('deg')
     sun_dec = sun.dec.to_value('deg')
 
-    roll = [
-        Ska.Sun.nominal_roll(r, d, sun_ra=sun_ra, sun_dec=sun_dec)
-        for r, d in zip(ra, dec)
+    roll_t = [
+        Ska.Sun.nominal_roll(ra, dec, sun_ra=sun_ra, sun_dec=sun_dec)
+        for ra, dec in zip(ra_t, dec_t)
     ]
- 
-    eq = np.array([ra, dec, roll]).T
+
+    eq = np.array([ra_t, dec_t, roll_t]).T
     q = Quat(equatorial=eq)
 
     return q
 
 
 class RunFPTempModels:
-    def __init__(self, tstart, tstop, model_spec=None):
+    def __init__(self, tstart=None, tstop=None, model_spec=None):
         if model_spec is None:
-            model_spec = get_xija_model_file('acisfp')
+            model_spec = 'acisfp_model_spec.json'
         self.ephem_table = ascii.read("ephem2023.dat")
         self.ephem_times = CxoTime(self.ephem_table["dates"].data).secs
+        if tstart is None:
+            tstart = self.ephem_times[0]
+        if tstop is None:
+            tstop = self.ephem_times[-1]
         self.model_spec = model_spec
         self._get_orbits(tstart, tstop)
         self.num_orbits = self.orbits.size
+        self.tstart = tstart
+        self.tstop = tstop
 
     def _get_ephem(self, tstart, tstop):
         tstart = float(CxoTime(tstart).secs)
@@ -129,7 +139,7 @@ class RunFPTempModels:
         orbitephem = np.array(
             [self.ephem_table[f"orbitephem0_{ax}"].data[idxs[0]:idxs[1]] for ax in "xyz"]
         )
-        return self.ephem_times[idxs[0]:idxs[1]], solarephem, orbitephem
+        return self.ephem_times[idxs[0]:idxs[1]], solarephem*1000.0, orbitephem*1000.0
 
     def _get_orbits(self, tstart, tstop):
         from scipy.signal import find_peaks
@@ -137,6 +147,11 @@ class RunFPTempModels:
         r = np.sqrt((orbitephem**2).sum(axis=0))
         idxs, _ = find_peaks(1.0/r)
         self.orbits = times[idxs]
+        self.r_perigee = r[idxs]*1.0e-3
+
+    @property
+    def a_perigee(self):
+        return self.r_perigee - R_e
 
     def calc_model(self, tstart, tstop, states):
         model = xija.ThermalModel("acisfp", start=tstart, stop=tstop,
@@ -168,26 +183,78 @@ class RunFPTempModels:
 
         return model
 
-    def run_models(self, exp_time=30.0, ntargs=100):
+    def run_perigees(self, run_time=60.0, ntargs=100):
+        import h5py
+        run_time *= 1000.0
+        for i in range(0, self.num_orbits):
+            tstart = self.orbits[i]-0.5*run_time
+            tstop = self.orbits[i]+0.5*run_time
+            datestart = CxoTime(tstart).date
+            datestop = CxoTime(tstop).date
+            b = datestart[:8].replace(":", "_")
+            e = datestop[:8].replace(":", "_")
+            f = h5py.File(f"acisfp_model_perigee_{b}_{e}.h5", "w")
+            f.attrs['tstart'] = tstart
+            f.attrs['tstop'] = tstop
+            f.attrs['datestart'] = datestart
+            f.attrs['datestop'] = datestop
+            q = generate_targets(tstart, ntargs)
+            f.create_dataset("q", data=q.q)
+            t = []
+            mvals = []
+            ephem_t = []
+            ephem_x = []
+            ephem_y = []
+            ephem_z = []
+            pitch = []
+            roll = []
+            esa = []
+            for k in range(q.shape[0]):
+                states = make_states(tstart, tstop, 0, q.q[k, :],
+                                     fep_count=3, clocking=0, 
+                                     simpos=-99616.0)
+                model = self.calc_model(tstart, tstop, states)
+                t.append(model.times)
+                mvals.append(model.comp["fptemp"].mvals)
+                ephem_t.append(model.comp["orbitephem0_x"].times)
+                ephem_x.append(model.comp["orbitephem0_x"].dvals)
+                ephem_y.append(model.comp["orbitephem0_y"].dvals)
+                ephem_z.append(model.comp["orbitephem0_z"].dvals)
+                pitch.append(model.comp["pitch"].dvals)
+                roll.append(model.comp["roll"].dvals)
+                esa.append(model.comp['earthheat__fptemp'].dvals)
+            f.create_dataset("times", data=np.array(t))
+            f.create_dataset("fptemp", data=np.array(mvals))
+            f.create_dataset("ephem_t", data=np.array(ephem_t))
+            f.create_dataset("ephem_x", data=np.array(ephem_x))
+            f.create_dataset("ephem_y", data=np.array(ephem_y))
+            f.create_dataset("ephem_z", data=np.array(ephem_z))
+            f.create_dataset("pitch", data=np.array(pitch))
+            f.create_dataset("roll", data=np.array(roll))
+            f.create_dataset("earth_solid_angle", data=np.array(esa))
+
+    def run_observations(self, exp_time=30.0, ntargs=100):
         import h5py
         exp_time *= 1000.0
         for i in range(0, self.num_orbits-1):
             times = np.arange(self.orbits[i], self.orbits[i+1], exp_time)
-            f = h5py.File(f"acisfp_model_orbit_{i}.h5", "w")
-            f.attrs['tstart'] = self.orbits[i]
-            f.attrs['tstop'] = self.orbits[i+1]
-            nobs = len(times)-1
             datestart = CxoTime(self.orbits[i]).date
             datestop = CxoTime(self.orbits[i+1]).date
+            b = datestart[:8].replace(":", "_")
+            e = datestop[:8].replace(":", "_")
+            f = h5py.File(f"acisfp_model_orbit_{b}_{e}.h5", "w")
+            f.attrs['tstart'] = self.orbits[i]
+            f.attrs['tstop'] = self.orbits[i+1]
+            nobs = len(times)
             f.attrs['datestart'] = datestart
             f.attrs['datestop'] = datestop
             print(f"Running orbit from {datestart} to {datestop}.")
             for j in range(nobs):
                 g = f.require_group(f"obs_{j}")
                 g.attrs['tstart'] = times[j]
-                g.attrs['tstop'] = times[j+1]
+                g.attrs['tstop'] = times[j]+exp_time
                 g.attrs['datestart'] = CxoTime(times[j]).date
-                g.attrs['datestop'] = CxoTime(times[j+1]).date
+                g.attrs['datestop'] = CxoTime(times[j]+exp_time).date
                 q = generate_targets(times[j], ntargs)
                 t = []
                 mvals = []
@@ -196,10 +263,12 @@ class RunFPTempModels:
                 ephem_y = []
                 ephem_z = []
                 pitch = []
+                roll = []
+                esa = []
                 g.create_dataset("q", data=q.q)
                 for k in range(q.shape[0]):
-                    states = make_states(times[j], times[j+1], 4, q.q[k,:])
-                    model = self.calc_model(times[j], times[j+1], states)
+                    states = make_states(times[j], times[j]+exp_time, 4, q.q[k,:])
+                    model = self.calc_model(times[j], times[j]+exp_time, states)
                     t.append(model.times)
                     mvals.append(model.comp["fptemp"].mvals)
                     ephem_t.append(model.comp["orbitephem0_x"].times)
@@ -207,25 +276,24 @@ class RunFPTempModels:
                     ephem_y.append(model.comp["orbitephem0_y"].dvals)
                     ephem_z.append(model.comp["orbitephem0_z"].dvals)
                     pitch.append(model.comp["pitch"].dvals)
-                t = np.array(t)
-                mvals = np.array(mvals)
-                ephem_t = np.array(ephem_t)
-                ephem_x = np.array(ephem_x)
-                ephem_y = np.array(ephem_y)
-                ephem_z = np.array(ephem_z)
-                pitch = np.array(pitch)
-                g.create_dataset("times", data=t)
-                g.create_dataset("fptemp", data=mvals)
-                g.create_dataset("ephem_t", data=ephem_t)
-                g.create_dataset("ephem_x", data=ephem_x)
-                g.create_dataset("ephem_y", data=ephem_y)
-                g.create_dataset("ephem_z", data=ephem_z)
-                g.create_dataset("pitch", data=pitch)
+                    roll.append(model.comp["roll"].dvals)
+                    esa.append(model.comp['earthheat__fptemp'].dvals)
+                g.create_dataset("times", data=np.array(t))
+                g.create_dataset("fptemp", data=np.array(mvals))
+                g.create_dataset("ephem_t", data=np.array(ephem_t))
+                g.create_dataset("ephem_x", data=np.array(ephem_x))
+                g.create_dataset("ephem_y", data=np.array(ephem_y))
+                g.create_dataset("ephem_z", data=np.array(ephem_z))
+                g.create_dataset("pitch", data=np.array(pitch))
+                g.create_dataset("roll", data=np.array(roll))
+                g.create_dataset("earth_solid_angle", data=np.array(esa))
 
             f.flush()
             f.close()
 
 
 if __name__ == "__main__":
-    runner = RunFPTempModels("2019:100:00:00:00", "2019:200:00:00:00")
-    runner.run_models()
+    runner = RunFPTempModels("2020:001:00:00:00", "2023:365:23:59:59",
+                             model_spec="acisfp_model_spec.json")
+    #runner.run_observations()
+    runner.run_perigees()
