@@ -10,10 +10,15 @@ from cxotime import CxoTime
 import Ska.Sun
 import Ska.quatutil
 import Ska.astro
+import h5py
 
 solar_system_ephemeris.set('jpl')
 
 R_e = R_earth.to_value("km")
+
+msid = {"dpa": "1dpamzt",
+        "acisfp": "fptemp"}
+
 
 def make_states(start, stop, ccd_count, q, fep_count=None, clocking=1,
                 simpos=75624.0):
@@ -125,7 +130,7 @@ class RunFPTempModels:
             tstop = self.ephem_times[-1]
         self.model_spec = model_spec
         self._get_orbits(tstart, tstop)
-        self.num_orbits = self.orbits.size
+        self.num_orbits = self.per_times.size
         self.tstart = tstart
         self.tstop = tstop
 
@@ -146,15 +151,20 @@ class RunFPTempModels:
         times, _, orbitephem = self._get_ephem(tstart, tstop)
         r = np.sqrt((orbitephem**2).sum(axis=0))
         idxs, _ = find_peaks(1.0/r)
-        self.orbits = times[idxs]
+        self.per_times = times[idxs]
+        self.per_dates = CxoTime(self.per_times).date
         self.r_perigee = r[idxs]*1.0e-3
+        t = ascii.read("rad_zones.orp")
+        self.el_dates = np.array([[t["GMT"][i], t["GMT"][i+1]]
+                                  for i in range(0, len(t), 2)])
+        self.el_times = CxoTime(self.el_dates).secs
 
     @property
     def a_perigee(self):
         return self.r_perigee - R_e
 
-    def calc_model(self, tstart, tstop, states):
-        model = xija.ThermalModel("acisfp", start=tstart, stop=tstop,
+    def calc_model(self, name, tstart, tstop, states, T_init=-119.8):
+        model = xija.ThermalModel(name, start=tstart, stop=tstop,
                                   model_spec=self.model_spec)
         ephem_times, solarephem, orbitephem = self._get_ephem(tstart, tstop)
         state_times = np.array([states['tstart'], states['tstop']])
@@ -165,35 +175,41 @@ class RunFPTempModels:
         pitch, roll = calc_pitch_roll(ephem_times, solarephem, orbitephem, states)
         model.comp['roll'].set_data(roll, ephem_times)
         model.comp['pitch'].set_data(pitch, ephem_times)
-        model.comp['dh_heater'].set_data(0.0, model.times)
-        model.comp["fptemp"].set_data(-119.8, None)
-
-        for i in range(1, 5):
-            model.comp[f'aoattqt{i}'].set_data(states[f'q{i}'], state_times)
-
-        for i, axis in enumerate("xyz"):
-            model.comp[f'orbitephem0_{axis}'].set_data(orbitephem[i,:], ephem_times)
-
+        model.comp[msid[name]].set_data(T_init, None)
         model.comp['dpa_power'].set_data(0.0)
-        model.comp['1cbat'].set_data(-53.0)
-        model.comp['sim_px'].set_data(-120.0)
+
+        if name == "acisfp":
+            model.comp['dh_heater'].set_data(0.0, model.times)
+            for i in range(1, 5):
+                model.comp[f'aoattqt{i}'].set_data(states[f'q{i}'], state_times)
+
+            for i, axis in enumerate("xyz"):
+                model.comp[f'orbitephem0_{axis}'].set_data(orbitephem[i,:], ephem_times)
+
+            model.comp['1cbat'].set_data(-53.0)
+            model.comp['sim_px'].set_data(T_init)
+        elif name == "dpa":
+            model.comp["dpa0"].set_data(T_init)
 
         model.make()
         model.calc()
 
         return model
 
-    def run_perigees(self, run_time=60.0, ntargs=100):
-        import h5py
-        run_time *= 1000.0
+    def _run(self):
+        pass
+
+    def run_perigees(self, ntargs=100, T_init=-119.8):
+        pad_time = 6000.0
         for i in range(0, self.num_orbits):
-            tstart = self.orbits[i]-0.5*run_time
-            tstop = self.orbits[i]+0.5*run_time
+            tstart = self.el_times[i, 0]-pad_time
+            tstop = self.el_times[i, 1]+pad_time
             datestart = CxoTime(tstart).date
             datestop = CxoTime(tstop).date
             b = datestart[:8].replace(":", "_")
             e = datestop[:8].replace(":", "_")
-            f = h5py.File(f"acisfp_model_perigee_{b}_{e}.h5", "w")
+            T = f"m{np.abs(np.round(T_init).astype('int'))}"
+            f = h5py.File(f"acisfp_model_perigee_{b}_{e}_{T}.h5", "w")
             f.attrs['tstart'] = tstart
             f.attrs['tstop'] = tstop
             f.attrs['datestart'] = datestart
@@ -213,7 +229,8 @@ class RunFPTempModels:
                 states = make_states(tstart, tstop, 0, q.q[k, :],
                                      fep_count=3, clocking=0, 
                                      simpos=-99616.0)
-                model = self.calc_model(tstart, tstop, states)
+                model = self.calc_model("acisfp", tstart, tstop, states, 
+                                        T_init=T_init)
                 t.append(model.times)
                 mvals.append(model.comp["fptemp"].mvals)
                 ephem_t.append(model.comp["orbitephem0_x"].times)
@@ -232,19 +249,21 @@ class RunFPTempModels:
             f.create_dataset("pitch", data=np.array(pitch))
             f.create_dataset("roll", data=np.array(roll))
             f.create_dataset("earth_solid_angle", data=np.array(esa))
+            f.flush()
+            f.close()
 
-    def run_observations(self, exp_time=30.0, ntargs=100):
-        import h5py
+    def run_observations(self, exp_time=30.0, ntargs=100, T_init=-119.8):
         exp_time *= 1000.0
         for i in range(0, self.num_orbits-1):
-            times = np.arange(self.orbits[i], self.orbits[i+1], exp_time)
-            datestart = CxoTime(self.orbits[i]).date
-            datestop = CxoTime(self.orbits[i+1]).date
+            times = np.arange(self.per_times[i], self.per_times[i+1], exp_time)
+            datestart = CxoTime(self.per_times[i]).date
+            datestop = CxoTime(self.per_times[i+1]).date
             b = datestart[:8].replace(":", "_")
             e = datestop[:8].replace(":", "_")
-            f = h5py.File(f"acisfp_model_orbit_{b}_{e}.h5", "w")
-            f.attrs['tstart'] = self.orbits[i]
-            f.attrs['tstop'] = self.orbits[i+1]
+            T = f"m{np.abs(np.round(T_init).astype('int'))}"
+            f = h5py.File(f"acisfp_model_orbit_{b}_{e}_{T}.h5", "w")
+            f.attrs['tstart'] = self.per_times[i]
+            f.attrs['tstop'] = self.per_times[i+1]
             nobs = len(times)
             f.attrs['datestart'] = datestart
             f.attrs['datestop'] = datestop
@@ -268,7 +287,8 @@ class RunFPTempModels:
                 g.create_dataset("q", data=q.q)
                 for k in range(q.shape[0]):
                     states = make_states(times[j], times[j]+exp_time, 4, q.q[k,:])
-                    model = self.calc_model(times[j], times[j]+exp_time, states)
+                    model = self.calc_model("acisfp", times[j], times[j]+exp_time,
+                                            states, T_init=T_init)
                     t.append(model.times)
                     mvals.append(model.comp["fptemp"].mvals)
                     ephem_t.append(model.comp["orbitephem0_x"].times)
@@ -293,7 +313,7 @@ class RunFPTempModels:
 
 
 if __name__ == "__main__":
-    runner = RunFPTempModels("2020:001:00:00:00", "2023:365:23:59:59",
+    runner = RunFPTempModels("2021:001:00:00:00", "2023:365:23:59:59",
                              model_spec="acisfp_model_spec.json")
     #runner.run_observations()
-    runner.run_perigees()
+    runner.run_perigees(T_init=-109.0)
