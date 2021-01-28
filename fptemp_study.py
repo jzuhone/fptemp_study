@@ -11,6 +11,7 @@ import Ska.Sun
 import Ska.quatutil
 import Ska.astro
 import h5py
+from collections import defaultdict
 
 solar_system_ephemeris.set('jpl')
 
@@ -20,8 +21,73 @@ msid = {"dpa": "1dpamzt",
         "acisfp": "fptemp"}
 
 
-def make_states(start, stop, ccd_count, q, fep_count=None, clocking=1,
-                simpos=75624.0):
+def make_radzone_states(datestart, datestop, eefdate, xefdate, q,
+                        pow2atime=None):
+    from kadi.commands import get_cmds_from_backstop, CommandTable, states
+    tstart = float(CxoTime(datestart).secs)
+    tstop = float(CxoTime(datestop).secs)
+    eeftime = float(CxoTime(eefdate).secs)
+    xeftime = float(CxoTime(xefdate).secs)
+    rz_cmds = CommandTable.read("rz_template.dat",
+                                format='ascii.commented_header')
+    # Get time differences
+    dt = np.diff(rz_cmds["time"])
+    # Make a new time array and reconstruct the times
+    new_time = rz_cmds["time"].copy()
+    # first stop science
+    new_time[0] = tstart
+    # second stop science
+    new_time[1] = new_time[0]+dt[0]
+    # power-down all FEPs and video boards
+    new_time[2] = new_time[1]+dt[1]
+    # power up FEPs and video boards
+    new_time[3] = new_time[2]+dt[2]
+    # start science
+    new_time[4] = new_time[3]+dt[3]
+    # stop science
+    new_time[5] = eeftime
+    # stop science again
+    new_time[6] = new_time[5]+dt[5]
+    # power-down all FEPs and video boards
+    new_time[7] = new_time[6]+dt[6]
+    # power up three FEPs
+    if pow2atime is None:
+        new_time[8] = new_time[7] + 3.0*3600.0
+    else:
+        new_time[8] = pow2atime
+    # first stop science
+    new_time[9] = xeftime
+    # second stop science
+    new_time[10] = new_time[9]+dt[9]
+    # power-down all FEPs and video boards
+    new_time[11] = new_time[10]+dt[10]
+    # power up FEPs and video boards
+    new_time[12] = new_time[11]+dt[11]
+    # start science
+    new_time[13] = new_time[12]+dt[12]
+    # stop science
+    new_time[14] = tstop
+    rz_cmds["time"] = new_time
+    rz_cmds["date"] = CxoTime(new_time).date
+    continuity = {
+        'ccd_count': 4,
+        'fep_count': 4,
+        'clocking': 0,
+        'vid_board': 1,
+        'simpos': -99616.0,
+        'q1': q[0],
+        'q2': q[1],
+        'q3': q[2],
+        'q4': q[3]
+    }
+    continuity['__dates__'] = {k: CxoTime(tstart-60.0).date for k in continuity}
+    st = states.get_states(cmds=rz_cmds, continuity=continuity)
+    return st.as_array()
+
+
+def make_constant_states(start, stop, ccd_count, q, 
+                         fep_count=None, clocking=1,
+                         simpos=75624.0):
     if fep_count is None:
         fep_count = ccd_count
     tstart = float(CxoTime(start).secs)
@@ -170,8 +236,8 @@ class RunFPTempModels:
         state_times = np.array([states['tstart'], states['tstop']])
         model.comp['sim_z'].set_data(states['simpos'], state_times)
         model.comp['eclipse'].set_data(False)
-        for name in ('ccd_count', 'fep_count', 'vid_board', 'clocking'):
-            model.comp[name].set_data(states[name], state_times)
+        for k in ('ccd_count', 'fep_count', 'vid_board', 'clocking'):
+            model.comp[k].set_data(states[k], state_times)
         pitch, roll = calc_pitch_roll(ephem_times, solarephem, orbitephem, states)
         model.comp['roll'].set_data(roll, ephem_times)
         model.comp['pitch'].set_data(pitch, ephem_times)
@@ -206,49 +272,58 @@ class RunFPTempModels:
             tstop = self.el_times[i, 1]+pad_time
             datestart = CxoTime(tstart).date
             datestop = CxoTime(tstop).date
+            eefdate = self.el_dates[i, 0]
+            xefdate = self.el_dates[i, 1]
             b = datestart[:8].replace(":", "_")
             e = datestop[:8].replace(":", "_")
             T = f"m{np.abs(np.round(T_init).astype('int'))}"
-            f = h5py.File(f"acisfp_model_perigee_{b}_{e}_{T}.h5", "w")
+            f = h5py.File(f"data/acisfp_model_perigee_{b}_{e}_{T}.h5", "w")
             f.attrs['tstart'] = tstart
             f.attrs['tstop'] = tstop
             f.attrs['datestart'] = datestart
             f.attrs['datestop'] = datestop
             q = generate_targets(tstart, ntargs)
             f.create_dataset("q", data=q.q)
-            t = []
-            mvals = []
-            ephem_t = []
-            ephem_x = []
-            ephem_y = []
-            ephem_z = []
-            pitch = []
-            roll = []
-            esa = []
-            for k in range(q.shape[0]):
-                states = make_states(tstart, tstop, 0, q.q[k, :],
-                                     fep_count=3, clocking=0, 
-                                     simpos=-99616.0)
-                model = self.calc_model("acisfp", tstart, tstop, states, 
-                                        T_init=T_init)
-                t.append(model.times)
-                mvals.append(model.comp["fptemp"].mvals)
-                ephem_t.append(model.comp["orbitephem0_x"].times)
-                ephem_x.append(model.comp["orbitephem0_x"].dvals)
-                ephem_y.append(model.comp["orbitephem0_y"].dvals)
-                ephem_z.append(model.comp["orbitephem0_z"].dvals)
-                pitch.append(model.comp["pitch"].dvals)
-                roll.append(model.comp["roll"].dvals)
-                esa.append(model.comp['earthheat__fptemp'].dvals)
-            f.create_dataset("times", data=np.array(t))
-            f.create_dataset("fptemp", data=np.array(mvals))
-            f.create_dataset("ephem_t", data=np.array(ephem_t))
-            f.create_dataset("ephem_x", data=np.array(ephem_x))
-            f.create_dataset("ephem_y", data=np.array(ephem_y))
-            f.create_dataset("ephem_z", data=np.array(ephem_z))
-            f.create_dataset("pitch", data=np.array(pitch))
-            f.create_dataset("roll", data=np.array(roll))
-            f.create_dataset("earth_solid_angle", data=np.array(esa))
+            output_fields = ["times", "fptemp", "1dpamzt", "ephem_t", 
+                             "ephem_x", "ephem_y", "ephem_z",
+                             "pitch", "roll", "esa", "ccd_count",
+                             "fep_count", "clocking"]
+            y = defaultdict(list)
+            for iq in range(q.shape[0]):
+                states = make_radzone_states(datestart, datestop, eefdate,
+                                             xefdate, q.q[iq, :])
+                dpa_model = self.calc_model("dpa", tstart, tstop, states,
+                                            T_init=T_init)
+                idxs = (dpa_model.comp["1dpamzt"] < 12.0) & \
+                       (dpa_model.comp["fep_count"] == 0)
+                if idxs.sum() > 0:
+                    pow2atime = dpa_model.times[idxs][0]
+                    states = make_radzone_states(datestart, datestop, eefdate,
+                                                 xefdate, q.q[iq, :],
+                                                 pow2atime=pow2atime)
+                    dpa_model = self.calc_model("dpa", tstart, tstop, states,
+                                                T_init=T_init)
+                fp_model = self.calc_model("acisfp", tstart, tstop, states,
+                                           T_init=T_init)
+                for k in output_fields:
+                    if k == "times":
+                        v = fp_model.times
+                    elif k == "fptemp":
+                        v = fp_model.comp["fptemp"].mvals
+                    elif k == "1dpamzt":
+                        v = dpa_model.comp["1dpamzt"].mvals
+                    elif k.startswith("ephem"):
+                        if k.endswith("t"):
+                            v = fp_model.comp["orbitephem0_x"].times
+                        else:
+                            v = fp_model.comp[f"orbitephem0_{k[-1]}"].dvals
+                    elif k == "esa":
+                        v = fp_model.comp["earthheat__fptemp"].dvals
+                    else:
+                        v = fp_model.comp[k].dvals
+                    y[k].append(v)
+            for k in output_fields:
+                f.create_dataset(k, data=np.array(y[k]))
             f.flush()
             f.close()
 
@@ -261,7 +336,7 @@ class RunFPTempModels:
             b = datestart[:8].replace(":", "_")
             e = datestop[:8].replace(":", "_")
             T = f"m{np.abs(np.round(T_init).astype('int'))}"
-            f = h5py.File(f"acisfp_model_orbit_{b}_{e}_{T}.h5", "w")
+            f = h5py.File(f"data/acisfp_model_orbit_{b}_{e}_{T}.h5", "w")
             f.attrs['tstart'] = self.per_times[i]
             f.attrs['tstop'] = self.per_times[i+1]
             nobs = len(times)
@@ -275,38 +350,33 @@ class RunFPTempModels:
                 g.attrs['datestart'] = CxoTime(times[j]).date
                 g.attrs['datestop'] = CxoTime(times[j]+exp_time).date
                 q = generate_targets(times[j], ntargs)
-                t = []
-                mvals = []
-                ephem_t = []
-                ephem_x = []
-                ephem_y = []
-                ephem_z = []
-                pitch = []
-                roll = []
-                esa = []
                 g.create_dataset("q", data=q.q)
-                for k in range(q.shape[0]):
-                    states = make_states(times[j], times[j]+exp_time, 4, q.q[k,:])
+                output_fields = ["times", "fptemp", "ephem_t",
+                                 "ephem_x", "ephem_y", "ephem_z",
+                                 "pitch", "roll", "esa"]
+                y = defaultdict(list)
+                for iq in range(q.shape[0]):
+                    states = make_constant_states(times[j], times[j]+exp_time, 
+                                                  4, q.q[iq, :])
                     model = self.calc_model("acisfp", times[j], times[j]+exp_time,
                                             states, T_init=T_init)
-                    t.append(model.times)
-                    mvals.append(model.comp["fptemp"].mvals)
-                    ephem_t.append(model.comp["orbitephem0_x"].times)
-                    ephem_x.append(model.comp["orbitephem0_x"].dvals)
-                    ephem_y.append(model.comp["orbitephem0_y"].dvals)
-                    ephem_z.append(model.comp["orbitephem0_z"].dvals)
-                    pitch.append(model.comp["pitch"].dvals)
-                    roll.append(model.comp["roll"].dvals)
-                    esa.append(model.comp['earthheat__fptemp'].dvals)
-                g.create_dataset("times", data=np.array(t))
-                g.create_dataset("fptemp", data=np.array(mvals))
-                g.create_dataset("ephem_t", data=np.array(ephem_t))
-                g.create_dataset("ephem_x", data=np.array(ephem_x))
-                g.create_dataset("ephem_y", data=np.array(ephem_y))
-                g.create_dataset("ephem_z", data=np.array(ephem_z))
-                g.create_dataset("pitch", data=np.array(pitch))
-                g.create_dataset("roll", data=np.array(roll))
-                g.create_dataset("earth_solid_angle", data=np.array(esa))
+                    for k in output_fields:
+                        if k == "times":
+                            v = model.times
+                        elif k == "fptemp":
+                            v = model.comp["fptemp"].mvals
+                        elif k.startswith("ephem"):
+                            if k.endswith("t"):
+                                v = model.comp["orbitephem0_x"].times
+                            else:
+                                v = model.comp[f"orbitephem0_{k[-1]}"].dvals
+                        elif k == "esa":
+                            v = model.comp["earthheat__fptemp"].dvals
+                        else:
+                            v = model.comp[k].dvals
+                        y[k].append(v)
+                for k in output_fields:
+                    g.create_dataset(k, data=np.array(y[k]))
 
             f.flush()
             f.close()
