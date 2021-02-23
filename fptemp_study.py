@@ -1,19 +1,12 @@
 import numpy as np
-from numpy.random import RandomState
-from Quaternion import Quat
 from astropy.io import ascii
 import xija
 from astropy.constants import R_earth
-from astropy.coordinates import solar_system_ephemeris, \
-    get_body, SkyCoord
 from cxotime import CxoTime
-import Ska.Sun
-import Ska.quatutil
-import Ska.astro
 import h5py
 from collections import defaultdict
-
-solar_system_ephemeris.set('jpl')
+import Ska.Numpy
+from gen_targets import generate_constant_targets
 
 R_e = R_earth.to_value("km")
 
@@ -23,7 +16,7 @@ msid = {"dpa": "1dpamzt",
 
 def make_radzone_states(datestart, datestop, eefdate, xefdate, q,
                         pow2atime=None):
-    from kadi.commands import get_cmds_from_backstop, CommandTable, states
+    from kadi.commands import CommandTable, states
     tstart = float(CxoTime(datestart).secs)
     tstop = float(CxoTime(datestop).secs)
     eeftime = float(CxoTime(eefdate).secs)
@@ -148,53 +141,21 @@ def calc_pitch_roll(times, sun_eci, chandra_eci, states):
     return pitch, roll
 
 
-def generate_targets(tstart, num_targs, prng=None):
-    if prng is None:
-        prng = np.random
-    elif isinstance(prng, int):
-        prng = RandomState(prng)
-
-    ra_t = np.array([])
-    dec_t = np.array([])
-
-    t = CxoTime(tstart)
-    sun = get_body('sun', t)
-
-    while len(ra_t) < num_targs:
-        ra = 360.0*prng.uniform(low=0.0, high=1.0, size=num_targs)
-        dec = np.arccos(prng.uniform(low=-1.0, high=1.0, size=num_targs))
-        dec = np.rad2deg(dec)-90.0
-        tcoord = SkyCoord(ra=ra, dec=dec, unit='deg')
-        pitch = sun.separation(tcoord).to_value("deg")
-        good = (pitch > 46.2) & (pitch < 177.9)
-        ra_t = np.append(ra_t, tcoord.ra.to_value("deg")[good])
-        dec_t = np.append(dec_t, tcoord.dec.to_value("deg")[good])
-
-    sun_ra = sun.ra.to_value('deg')
-    sun_dec = sun.dec.to_value('deg')
-
-    roll_t = [
-        Ska.Sun.nominal_roll(ra, dec, sun_ra=sun_ra, sun_dec=sun_dec)
-        for ra, dec in zip(ra_t, dec_t)
-    ]
-
-    eq = np.array([ra_t, dec_t, roll_t]).T
-    q = Quat(equatorial=eq)
-
-    return q
-
-
 class RunFPTempModels:
-    def __init__(self, tstart=None, tstop=None, model_spec=None):
-        if model_spec is None:
-            model_spec = 'acisfp_model_spec.json'
+    def __init__(self, tstart=None, tstop=None, fp_model_spec=None,
+                 dpa_model_spec=None):
+        if fp_model_spec is None:
+            fp_model_spec = 'acisfp_model_spec.json'
+        if dpa_model_spec is None:
+            dpa_model_spec = 'dpa_model_spec.json'
         self.ephem_table = ascii.read("ephem2023.dat")
         self.ephem_times = CxoTime(self.ephem_table["dates"].data).secs
         if tstart is None:
             tstart = self.ephem_times[0]
         if tstop is None:
             tstop = self.ephem_times[-1]
-        self.model_spec = model_spec
+        self.fp_model_spec = fp_model_spec
+        self.dpa_model_spec = dpa_model_spec
         self._get_orbits(tstart, tstop)
         self.num_orbits = self.per_times.size
         self.tstart = tstart
@@ -229,9 +190,9 @@ class RunFPTempModels:
     def a_perigee(self):
         return self.r_perigee - R_e
 
-    def calc_model(self, name, tstart, tstop, states, T_init=-119.8):
+    def calc_model(self, name, tstart, tstop, states, model_spec, T_init=-119.8):
         model = xija.ThermalModel(name, start=tstart, stop=tstop,
-                                  model_spec=self.model_spec)
+                                  model_spec=model_spec)
         ephem_times, solarephem, orbitephem = self._get_ephem(tstart, tstop)
         state_times = np.array([states['tstart'], states['tstop']])
         model.comp['sim_z'].set_data(states['simpos'], state_times)
@@ -262,10 +223,16 @@ class RunFPTempModels:
 
         return model
 
-    def _run(self):
-        pass
+    def get_target(self, which_targs, orbit_num):
+        if which_targs == "const":
+            with h5py.File("const_atts.h5", "r") as f:
+                g = f[f"orbit_{orbit_num}"]
+                q = g["q"]
+        else:
+            raise NotImplementedError
+        return q
 
-    def run_perigees(self, ntargs=100, T_init=-119.8):
+    def run_perigees(self, which_targs, T_init=-119.8):
         pad_time = 6000.0
         for i in range(0, self.num_orbits):
             tstart = self.el_times[i, 0]-pad_time
@@ -282,8 +249,8 @@ class RunFPTempModels:
             f.attrs['tstop'] = tstop
             f.attrs['datestart'] = datestart
             f.attrs['datestop'] = datestop
-            q = generate_targets(tstart, ntargs)
-            f.create_dataset("q", data=q.q)
+            q = self.get_target(which_targs, i)
+            f.create_dataset("q", data=q)
             output_fields = ["times", "fptemp", "1dpamzt", "ephem_t", 
                              "ephem_x", "ephem_y", "ephem_z",
                              "pitch", "roll", "esa", "ccd_count",
@@ -291,20 +258,20 @@ class RunFPTempModels:
             y = defaultdict(list)
             for iq in range(q.shape[0]):
                 states = make_radzone_states(datestart, datestop, eefdate,
-                                             xefdate, q.q[iq, :])
+                                             xefdate, q[iq, :])
                 dpa_model = self.calc_model("dpa", tstart, tstop, states,
-                                            T_init=T_init)
-                idxs = (dpa_model.comp["1dpamzt"] < 12.0) & \
-                       (dpa_model.comp["fep_count"] == 0)
+                                            self.dpa_model_spec, T_init=20.0)
+                idxs = (dpa_model.comp["1dpamzt"].mvals < 12.0) & \
+                       (dpa_model.comp["fep_count"].dvals == 0)
                 if idxs.sum() > 0:
                     pow2atime = dpa_model.times[idxs][0]
                     states = make_radzone_states(datestart, datestop, eefdate,
                                                  xefdate, q.q[iq, :],
                                                  pow2atime=pow2atime)
                     dpa_model = self.calc_model("dpa", tstart, tstop, states,
-                                                T_init=T_init)
+                                                self.dpa_model_spec, T_init=20.0)
                 fp_model = self.calc_model("acisfp", tstart, tstop, states,
-                                           T_init=T_init)
+                                           self.fp_model_spec, T_init=T_init)
                 for k in output_fields:
                     if k == "times":
                         v = fp_model.times
@@ -349,17 +316,17 @@ class RunFPTempModels:
                 g.attrs['tstop'] = times[j]+exp_time
                 g.attrs['datestart'] = CxoTime(times[j]).date
                 g.attrs['datestop'] = CxoTime(times[j]+exp_time).date
-                q = generate_targets(times[j], ntargs)
-                g.create_dataset("q", data=q.q)
+                q = generate_constant_targets(times[j], ntargs)
+                g.create_dataset("q", data=q)
                 output_fields = ["times", "fptemp", "ephem_t",
                                  "ephem_x", "ephem_y", "ephem_z",
                                  "pitch", "roll", "esa"]
                 y = defaultdict(list)
                 for iq in range(q.shape[0]):
                     states = make_constant_states(times[j], times[j]+exp_time, 
-                                                  4, q.q[iq, :])
-                    model = self.calc_model("acisfp", times[j], times[j]+exp_time,
-                                            states, T_init=T_init)
+                                                  4, q[iq, :])
+                    model = self.calc_model("acisfp", times[j], times[j]+exp_time, 
+                                            states, self.fp_model_spec, T_init=T_init)
                     for k in output_fields:
                         if k == "times":
                             v = model.times
@@ -384,6 +351,7 @@ class RunFPTempModels:
 
 if __name__ == "__main__":
     runner = RunFPTempModels("2021:001:00:00:00", "2023:365:23:59:59",
-                             model_spec="acisfp_model_spec.json")
+                             fp_model_spec="acisfp_model_spec.json",
+                             dpa_model_spec="dpa_model_spec.json")
     #runner.run_observations()
     runner.run_perigees(T_init=-109.0)

@@ -1,2 +1,4 @@
-*.h5
+data/*.h5
+*.pdf
+*.png
 __pycache__
