@@ -7,6 +7,7 @@ import h5py
 from collections import defaultdict
 import Ska.Numpy
 from gen_targets import generate_constant_targets
+import argparse
 
 R_e = R_earth.to_value("km")
 
@@ -14,7 +15,7 @@ msid = {"dpa": "1dpamzt",
         "acisfp": "fptemp"}
 
 
-def make_radzone_states(datestart, datestop, eefdate, xefdate, q,
+def make_radzone_states(datestart, datestop, eefdate, xefdate, qinit,
                         pow2atime=None):
     from kadi.commands import CommandTable, states
     tstart = float(CxoTime(datestart).secs)
@@ -68,10 +69,10 @@ def make_radzone_states(datestart, datestop, eefdate, xefdate, q,
         'clocking': 0,
         'vid_board': 1,
         'simpos': -99616.0,
-        'q1': q[0],
-        'q2': q[1],
-        'q3': q[2],
-        'q4': q[3]
+        'q1': qinit[0],
+        'q2': qinit[1],
+        'q3': qinit[2],
+        'q4': qinit[3]
     }
     continuity['__dates__'] = {k: CxoTime(tstart-60.0).date for k in continuity}
     st = states.get_states(cmds=rz_cmds, continuity=continuity)
@@ -104,7 +105,7 @@ def make_constant_states(start, stop, ccd_count, q,
     return data
 
 
-def calc_pitch_roll(times, sun_eci, chandra_eci, states):
+def calc_pitch_roll(times, sun_eci, chandra_eci, qtimes, q):
     """Calculate the normalized sun vector in body coordinates.
     Shamelessly copied from Ska.engarchive.derived.pcad but 
     modified to use commanded states quaternions
@@ -120,15 +121,12 @@ def calc_pitch_roll(times, sun_eci, chandra_eci, states):
     3 NumPy arrays: time, pitch and roll
     """
     from Ska.engarchive.derived.pcad import arccos_clip, qrotate
-    idxs = Ska.Numpy.interpolate(np.arange(len(states)), states['tstart'],
+    idxs = Ska.Numpy.interpolate(np.arange(len(qtimes)), qtimes,
                                  times, method='nearest')
-    states = states[idxs]
+    q = q[:, idxs]
 
     sun_vec = -chandra_eci + sun_eci
-    est_quat = np.array([states['q1'],
-                         states['q2'],
-                         states['q3'],
-                         states['q4']])
+    est_quat = np.array([q[0, :], q[1, :], q[2, :], q[3, :]])
 
     sun_vec_b = qrotate(est_quat, sun_vec)  # Rotate into body frame
     magnitude = np.sqrt((sun_vec_b ** 2).sum(axis=0))
@@ -138,7 +136,7 @@ def calc_pitch_roll(times, sun_eci, chandra_eci, states):
     pitch = np.degrees(arccos_clip(sun_vec_b[0, :]))
     roll = np.degrees(np.arctan2(-sun_vec_b[1, :], -sun_vec_b[2, :]))
 
-    return pitch, roll
+    return pitch, roll, q
 
 
 class RunFPTempModels:
@@ -190,7 +188,8 @@ class RunFPTempModels:
     def a_perigee(self):
         return self.r_perigee - R_e
 
-    def calc_model(self, name, tstart, tstop, states, model_spec, T_init=-119.8):
+    def calc_model(self, name, tstart, tstop, states, model_spec, 
+                   qtimes, q, T_init=-119.8):
         model = xija.ThermalModel(name, start=tstart, stop=tstop,
                                   model_spec=model_spec)
         ephem_times, solarephem, orbitephem = self._get_ephem(tstart, tstop)
@@ -199,7 +198,8 @@ class RunFPTempModels:
         model.comp['eclipse'].set_data(False)
         for k in ('ccd_count', 'fep_count', 'vid_board', 'clocking'):
             model.comp[k].set_data(states[k], state_times)
-        pitch, roll = calc_pitch_roll(ephem_times, solarephem, orbitephem, states)
+        pitch, roll, qnew = calc_pitch_roll(ephem_times, solarephem, orbitephem, 
+                                            qtimes, q)
         model.comp['roll'].set_data(roll, ephem_times)
         model.comp['pitch'].set_data(pitch, ephem_times)
         model.comp[msid[name]].set_data(T_init, None)
@@ -208,7 +208,7 @@ class RunFPTempModels:
         if name == "acisfp":
             model.comp['dh_heater'].set_data(0.0, model.times)
             for i in range(1, 5):
-                model.comp[f'aoattqt{i}'].set_data(states[f'q{i}'], state_times)
+                model.comp[f'aoattqt{i}'].set_data(q[i-1,:], qtimes)
 
             for i, axis in enumerate("xyz"):
                 model.comp[f'orbitephem0_{axis}'].set_data(orbitephem[i,:], ephem_times)
@@ -224,13 +224,21 @@ class RunFPTempModels:
         return model
 
     def get_target(self, which_targs, orbit_num):
-        if which_targs == "const":
-            with h5py.File("const_atts.h5", "r") as f:
-                g = f[f"orbit_{orbit_num}"]
-                q = g["q"]
-        else:
-            raise NotImplementedError
-        return q
+        with h5py.File(f"{which_targs}_atts.h5", "r") as f:
+            print(f"orbit_{orbit_num}")
+            g = f[f"orbit_{orbit_num}"]
+            if which_targs == "const":
+                nt = g["q"].shape[0]
+                q = g["q"][()].reshape(nt, 4, 1)
+                t = None
+            else:
+                if 't' not in g:
+                    t = None
+                    q = None
+                else:
+                    t = g['t'][()]
+                    q = g["q"][()].T.reshape(1, 4, t.size)
+        return t, q
 
     def run_perigees(self, which_targs, T_init=-119.8):
         pad_time = 6000.0
@@ -244,34 +252,59 @@ class RunFPTempModels:
             b = datestart[:8].replace(":", "_")
             e = datestop[:8].replace(":", "_")
             T = f"m{np.abs(np.round(T_init).astype('int'))}"
-            f = h5py.File(f"data/acisfp_model_perigee_{b}_{e}_{T}.h5", "w")
+            t, q = self.get_target(which_targs, i)
+            if t is None and q is None:
+                continue
+            f = h5py.File(f"data/acisfp_model_perigee_{which_targs}_{b}_{e}_{T}.h5", "w")
             f.attrs['tstart'] = tstart
             f.attrs['tstop'] = tstop
             f.attrs['datestart'] = datestart
             f.attrs['datestop'] = datestop
-            q = self.get_target(which_targs, i)
-            f.create_dataset("q", data=q)
             output_fields = ["times", "fptemp", "1dpamzt", "ephem_t", 
                              "ephem_x", "ephem_y", "ephem_z",
                              "pitch", "roll", "esa", "ccd_count",
-                             "fep_count", "clocking"]
+                             "fep_count", "clocking", "q1", "q2",
+                             "q3", "q4"]
             y = defaultdict(list)
             for iq in range(q.shape[0]):
                 states = make_radzone_states(datestart, datestop, eefdate,
-                                             xefdate, q[iq, :])
+                                             xefdate, q[iq, :, 0])
+                if which_targs == "const":
+                    qtimes = states['tstart']
+                    quat = np.array([states['q1'],
+                                     states['q2'],
+                                     states['q3'],
+                                     states['q4']])
+                else:
+                    qtimes = t
+                    quat = q[0,:,:]
+
                 dpa_model = self.calc_model("dpa", tstart, tstop, states,
-                                            self.dpa_model_spec, T_init=20.0)
+                                            self.dpa_model_spec, qtimes, quat, 
+                                            T_init=20.0)
                 idxs = (dpa_model.comp["1dpamzt"].mvals < 12.0) & \
                        (dpa_model.comp["fep_count"].dvals == 0)
                 if idxs.sum() > 0:
                     pow2atime = dpa_model.times[idxs][0]
                     states = make_radzone_states(datestart, datestop, eefdate,
-                                                 xefdate, q.q[iq, :],
+                                                 xefdate, q[iq, :, 0],
                                                  pow2atime=pow2atime)
+                    if which_targs == "const":
+                        qtimes = states['tstart']
+                        quat = np.array([states['q1'],
+                                         states['q2'],
+                                         states['q3'],
+                                         states['q4']])
+                    else:
+                        qtimes = t
+                        quat = q[0,:,:]
+
                     dpa_model = self.calc_model("dpa", tstart, tstop, states,
-                                                self.dpa_model_spec, T_init=20.0)
+                                                self.dpa_model_spec, qtimes, 
+                                                quat, T_init=20.0)
                 fp_model = self.calc_model("acisfp", tstart, tstop, states,
-                                           self.fp_model_spec, T_init=T_init)
+                                           self.fp_model_spec, qtimes, 
+                                           quat, T_init=T_init)
                 for k in output_fields:
                     if k == "times":
                         v = fp_model.times
@@ -286,11 +319,16 @@ class RunFPTempModels:
                             v = fp_model.comp[f"orbitephem0_{k[-1]}"].dvals
                     elif k == "esa":
                         v = fp_model.comp["earthheat__fptemp"].dvals
+                    elif k.startswith('q'):
+                        v = fp_model.comp[f'aoattqt{k[-1]}'].dvals
                     else:
                         v = fp_model.comp[k].dvals
                     y[k].append(v)
             for k in output_fields:
-                f.create_dataset(k, data=np.array(y[k]))
+                if which_targs == "const":
+                    f.create_dataset(k, data=np.array(y[k]))
+                else:
+                    f.create_dataset(k, data=y[k][0])
             f.flush()
             f.close()
 
@@ -350,8 +388,13 @@ class RunFPTempModels:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.set_defaults()
+    parser.add_argument("which_targs", type=str)
+    parser.add_argument("T_init", type=float)
+    args = parser.parse_args()
     runner = RunFPTempModels("2021:001:00:00:00", "2023:365:23:59:59",
                              fp_model_spec="acisfp_model_spec.json",
                              dpa_model_spec="dpa_model_spec.json")
     #runner.run_observations()
-    runner.run_perigees(T_init=-109.0)
+    runner.run_perigees(args.which_targs, T_init=args.T_init)
