@@ -11,7 +11,7 @@ q = []
 pad_time = 6000.0
 for j in trange(runner.num_orbits):
     tstart = runner.el_times[j, 0]-pad_time
-    q.append(generate_constant_targets(tstart, 100))
+    q.append(generate_constant_targets(tstart, 1000))
 
 with h5py.File("const_atts.h5", "w") as f:
     for i in range(len(q)):

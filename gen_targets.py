@@ -8,6 +8,7 @@ from pathlib import Path
 import xija
 from astropy.io import fits
 from Quaternion import Quat
+from sparkles.roll_optimize import allowed_rolldev
 
 
 solar_system_ephemeris.set('jpl')
@@ -82,6 +83,7 @@ def generate_worst_targets(times, ephem, prng=None, num_targs=5000):
         tcoord = SkyCoord(ra=ra, dec=dec, unit='deg')
         pitch = sun[i].separation(tcoord).to_value("deg")
         good = (pitch > 46.2) & (pitch < 177.9)
+        pitch = pitch[good]
         ra = tcoord.ra.to_value("deg")[good]
         dec = tcoord.dec.to_value("deg")[good]
         sun_ra = sun[i].ra.to_value('deg')
@@ -90,7 +92,8 @@ def generate_worst_targets(times, ephem, prng=None, num_targs=5000):
             Ska.Sun.nominal_roll(r, d, sun_ra=sun_ra, sun_dec=sun_dec)
             for r, d in zip(ra, dec)
         ])
-        roll += prng.uniform(low=-10.0, high=10.0, size=ra.size)
+        droll = allowed_rolldev(pitch).data
+        roll += prng.uniform(low=-droll, high=droll)
         roll[roll < 0.0] += 360.0
         roll[roll > 360.0] -= 360.0
         eq = np.array([ra, dec, roll]).T
@@ -111,6 +114,7 @@ def generate_constant_targets(tstart, num_targs, prng=None):
 
     ra_t = np.array([])
     dec_t = np.array([])
+    pitch_t = np.array([])
 
     t = CxoTime(tstart)
     sun = get_body('sun', t)
@@ -124,14 +128,20 @@ def generate_constant_targets(tstart, num_targs, prng=None):
         good = (pitch > 46.2) & (pitch < 177.9)
         ra_t = np.append(ra_t, tcoord.ra.to_value("deg")[good])
         dec_t = np.append(dec_t, tcoord.dec.to_value("deg")[good])
+        pitch_t = np.append(pitch_t, pitch[good])
 
     sun_ra = sun.ra.to_value('deg')
     sun_dec = sun.dec.to_value('deg')
 
-    roll_t = [
+    roll_t = np.array([
         Ska.Sun.nominal_roll(ra, dec, sun_ra=sun_ra, sun_dec=sun_dec)
         for ra, dec in zip(ra_t, dec_t)
-    ]
+    ])
+
+    droll = allowed_rolldev(pitch_t).data
+    roll_t += prng.uniform(low=-droll, high=droll)
+    roll_t[roll_t < 0.0] += 360.0
+    roll_t[roll_t > 360.0] -= 360.0
 
     eq = np.array([ra_t, dec_t, roll_t]).T
     q = Quat(equatorial=eq).q
