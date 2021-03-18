@@ -21,7 +21,7 @@ for j in trange(runner.num_orbits):
 t = np.array(t)
 q = np.array(q)
 
-with h5py.File("const_atts.h5", "w") as f:
+with h5py.File("worst_atts.h5", "w") as f:
     for i in range(len(t)):
         g = f.create_group(f"orbit_{i}")
         g.create_dataset("t", data=t[i])
